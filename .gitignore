@@ -1,0 +1,15 @@
+.DS_Store
+._*
+*.pyc
+__pycache__/
+.mypy_cache/
+
+venv/
+.venv/
+.docker-venv/
+
+build/
+dist/
+
+data/
+output/
