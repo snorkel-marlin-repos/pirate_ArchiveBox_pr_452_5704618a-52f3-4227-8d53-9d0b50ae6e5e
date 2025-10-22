@@ -50,7 +50,7 @@ def verify_snapshots(modeladmin, request, queryset):
 verify_snapshots.short_description = "Check"
 
 def delete_snapshots(modeladmin, request, queryset):
-    remove(links=[snapshot.as_link() for snapshot in queryset], yes=True, delete=True, out_dir=OUTPUT_DIR)
+    remove(snapshots=queryset, yes=True, delete=True, out_dir=OUTPUT_DIR)
 
 delete_snapshots.short_description = "Delete"
 
@@ -58,9 +58,9 @@ delete_snapshots.short_description = "Delete"
 class SnapshotAdmin(admin.ModelAdmin):
     list_display = ('added', 'title_str', 'url_str', 'files', 'size')
     sort_fields = ('title_str', 'url_str', 'added')
-    readonly_fields = ('id', 'url', 'timestamp', 'title', 'tags', 'num_outputs', 'is_archived', 'url_hash', 'added', 'updated')
+    readonly_fields = ('id', 'url', 'timestamp', 'num_outputs', 'is_archived', 'url_hash', 'added', 'updated')
     search_fields = ('url', 'timestamp', 'title', 'tags')
-    fields = (*readonly_fields,)
+    fields = (*readonly_fields, 'title', 'tags')
     list_filter = ('added', 'updated', 'tags')
     ordering = ['-added']
     actions = [delete_snapshots, overwrite_snapshots, update_snapshots, update_titles, verify_snapshots]

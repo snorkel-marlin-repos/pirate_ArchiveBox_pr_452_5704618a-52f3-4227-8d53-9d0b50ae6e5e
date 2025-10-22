@@ -2,14 +2,14 @@ __package__ = 'archivebox.extractors'
 
 import os
 
-from typing import Optional, List, Iterable
+from typing import Optional, List, Iterable, Union
 from datetime import datetime
+from django.db.models import QuerySet
 
 from ..index.schema import Link
 from ..index import (
     load_link_details,
     write_link_details,
-    patch_main_index,
 )
 from ..util import enforce_types
 from ..logging_util import (
@@ -113,13 +113,6 @@ def archive_link(link: Link, overwrite: bool=False, methods: Optional[Iterable[s
             pass
 
         write_link_details(link, out_dir=out_dir, skip_sql_index=skip_index)
-        if not skip_index:
-            patch_main_index(link)
-
-        # # If any changes were made, update the main links index json and html
-        # was_changed = stats['succeeded'] or stats['failed']
-        # if was_changed:
-        #     patch_main_index(link)
 
         log_link_archiving_finished(link, link.link_dir, is_new, stats)
 
@@ -136,24 +129,33 @@ def archive_link(link: Link, overwrite: bool=False, methods: Optional[Iterable[s
 
     return link
 
-
 @enforce_types
-def archive_links(links: List[Link], overwrite: bool=False, methods: Optional[Iterable[str]]=None, out_dir: Optional[str]=None) -> List[Link]:
-    if not links:
+def archive_links(all_links: Union[Iterable[Link], QuerySet], overwrite: bool=False, methods: Optional[Iterable[str]]=None, out_dir: Optional[str]=None) -> List[Link]:
+
+    if type(all_links) is QuerySet:
+        num_links: int = all_links.count()
+        get_link = lambda x: x.as_link()
+        all_links = all_links.iterator()
+    else:
+        num_links: int = len(all_links)
+        get_link = lambda x: x
+
+    if num_links == 0:
         return []
 
-    log_archiving_started(len(links))
+    log_archiving_started(num_links)
     idx: int = 0
-    link: Link = links[0]
     try:
-        for idx, link in enumerate(links):
-            archive_link(link, overwrite=overwrite, methods=methods, out_dir=link.link_dir)
+        for link in all_links:
+            idx += 1
+            to_archive = get_link(link)
+            archive_link(to_archive, overwrite=overwrite, methods=methods, out_dir=link.link_dir)
     except KeyboardInterrupt:
-        log_archiving_paused(len(links), idx, link.timestamp)
+        log_archiving_paused(num_links, idx, link.timestamp)
         raise SystemExit(0)
     except BaseException:
         print()
         raise
 
-    log_archiving_finished(len(links))
-    return links
+    log_archiving_finished(num_links)
+    return all_links

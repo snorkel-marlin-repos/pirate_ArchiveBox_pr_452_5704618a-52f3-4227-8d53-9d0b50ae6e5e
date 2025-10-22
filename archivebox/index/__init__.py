@@ -1,23 +1,24 @@
 __package__ = 'archivebox.index'
 
-import re
 import os
 import shutil
 import json as pyjson
+from pathlib import Path
 
 from itertools import chain
 from typing import List, Tuple, Dict, Optional, Iterable
 from collections import OrderedDict
 from contextlib import contextmanager
 from urllib.parse import urlparse
+from django.db.models import QuerySet, Q
 
-from ..system import atomic_write
 from ..util import (
     scheme,
     enforce_types,
     ExtendedEncoder,
 )
 from ..config import (
+    setup_django,
     ARCHIVE_DIR_NAME,
     SQL_INDEX_FILENAME,
     JSON_INDEX_FILENAME,
@@ -25,7 +26,6 @@ from ..config import (
     OUTPUT_DIR,
     TIMEOUT,
     URL_BLACKLIST_PTN,
-    ANSI,
     stderr,
     OUTPUT_PERMISSIONS
 )
@@ -45,14 +45,12 @@ from .html import (
     write_html_link_details,
 )
 from .json import (
-    parse_json_main_index,
     write_json_main_index,
     parse_json_link_details, 
     write_json_link_details,
 )
 from .sql import (
     write_sql_main_index,
-    parse_sql_main_index,
     write_sql_link_details,
 )
 
@@ -135,7 +133,6 @@ def validate_links(links: Iterable[Link]) -> List[Link]:
 
     return list(links)
 
-
 @enforce_types
 def archivable_links(links: Iterable[Link]) -> Iterable[Link]:
     """remove chrome://, about:// or other schemed links that cant be archived"""
@@ -167,15 +164,6 @@ def fix_duplicate_links(sorted_links: Iterable[Link]) -> Iterable[Link]:
             link = merge_links(unique_urls[link.url], link)
         unique_urls[link.url] = link
 
-    # unique_timestamps: OrderedDict[str, Link] = OrderedDict()
-    # for link in unique_urls.values():
-    #     closest_non_duplicate_ts = lowest_uniq_timestamp(unique_timestamps, link.timestamp)
-    #     if closest_non_duplicate_ts != link.timestamp:
-    #         link = link.overwrite(timestamp=closest_non_duplicate_ts)
-    #         Snapshot.objects.filter(url=link.url).update(timestamp=link.timestamp)
-    #     unique_timestamps[link.timestamp] = link
-
-    # return unique_timestamps.values()
     return unique_urls.values()
 
 
@@ -246,11 +234,8 @@ def write_main_index(links: List[Link], out_dir: str=OUTPUT_DIR, finished: bool=
             write_sql_main_index(links, out_dir=out_dir)
             os.chmod(os.path.join(out_dir, SQL_INDEX_FILENAME), int(OUTPUT_PERMISSIONS, base=8)) # set here because we don't write it with atomic writes
 
-        with timed_index_update(os.path.join(out_dir, JSON_INDEX_FILENAME)):
-            write_json_main_index(links, out_dir=out_dir)
-
-        with timed_index_update(os.path.join(out_dir, HTML_INDEX_FILENAME)):
-            write_html_main_index(links, out_dir=out_dir, finished=finished)
+        if finished:
+            write_static_index(links, out_dir=out_dir)
     except (KeyboardInterrupt, SystemExit):
         stderr('[!] Warning: Still writing index to disk...', color='lightyellow')
         stderr('    Run archivebox init to fix any inconsisntencies from an ungraceful exit.')
@@ -261,37 +246,29 @@ def write_main_index(links: List[Link], out_dir: str=OUTPUT_DIR, finished: bool=
 
     log_indexing_process_finished()
 
+@enforce_types
+def write_static_index(links: List[Link], out_dir: str=OUTPUT_DIR) -> None:
+    with timed_index_update(os.path.join(out_dir, JSON_INDEX_FILENAME)):
+        write_json_main_index(links)
+    with timed_index_update(os.path.join(out_dir, HTML_INDEX_FILENAME)):
+        write_html_main_index(links, out_dir=out_dir, finished=True)
+
+@enforce_types
+def get_empty_snapshot_queryset(out_dir: str=OUTPUT_DIR):
+    setup_django(out_dir, check_db=True)
+    from core.models import Snapshot
+    return Snapshot.objects.none()
 
 @enforce_types
 def load_main_index(out_dir: str=OUTPUT_DIR, warn: bool=True) -> List[Link]:
     """parse and load existing index with any new links from import_path merged in"""
-
-    all_links: List[Link] = []
+    setup_django(out_dir, check_db=True)
+    from core.models import Snapshot
     try:
-        all_links = list(parse_json_main_index(out_dir))
-        links_from_sql = list(parse_sql_main_index(out_dir))
+        return Snapshot.objects.all()
 
-        json_urls = set(l.url for l in all_links)
-        sql_urls = set(l.url for l in links_from_sql)
-        only_in_sql = sql_urls - json_urls
-        only_in_json = json_urls - sql_urls
-
-        if only_in_json:
-            stderr('{red}[!] Warning: SQL index does not match JSON index!{reset}'.format(**ANSI))
-            if only_in_json:
-                stderr('    > Only in JSON: {}...'.format(', '.join(list(only_in_json)[:5])))
-            if only_in_sql:
-                stderr('    > Only in SQL: {}...'.format(', '.join(list(only_in_sql)[:5])))
-
-            stderr('    To repair the index and re-import any orphaned links run:')
-            stderr('        archivebox init')
-        if only_in_sql:
-            # meh, this harmless, it'll get overwritten on next run anyway
-            pass
     except (KeyboardInterrupt, SystemExit):
         raise SystemExit(0)
-
-    return all_links
 
 @enforce_types
 def load_main_index_meta(out_dir: str=OUTPUT_DIR) -> Optional[dict]:
@@ -322,67 +299,47 @@ def parse_links_from_source(source_path: str, root_url: Optional[str]=None) -> T
 
     return new_links
 
+@enforce_types
+def fix_duplicate_links_in_index(snapshots: QuerySet, links: Iterable[Link]) -> Iterable[Link]:
+    """
+    Given a list of in-memory Links, dedupe and merge them with any conflicting Snapshots in the DB.
+    """
+    unique_urls: OrderedDict[str, Link] = OrderedDict()
+
+    for link in links:
+        index_link = snapshots.filter(url=link.url)
+        if index_link:
+            link = merge_links(index_link[0].as_link(), link)
+
+        unique_urls[link.url] = link
+
+    return unique_urls.values()
 
 @enforce_types
-def dedupe_links(existing_links: List[Link],
-                 new_links: List[Link]) -> Tuple[List[Link], List[Link]]:
-
+def dedupe_links(snapshots: QuerySet,
+                 new_links: List[Link]) -> List[Link]:
+    """
+    The validation of links happened at a different stage. This method will
+    focus on actual deduplication and timestamp fixing.
+    """
+    
     # merge existing links in out_dir and new links
-    all_links = validate_links(existing_links + new_links)
-    all_link_urls = {link.url for link in existing_links}
+    dedup_links = fix_duplicate_links_in_index(snapshots, new_links)
 
     new_links = [
         link for link in new_links
-        if link.url not in all_link_urls
+        if not snapshots.filter(url=link.url).exists()
     ]
 
-    all_links_deduped = {link.url: link for link in all_links}
+    dedup_links_dict = {link.url: link for link in dedup_links}
+
+    # Replace links in new_links with the dedup version
     for i in range(len(new_links)):
-        if new_links[i].url in all_links_deduped.keys():
-            new_links[i] = all_links_deduped[new_links[i].url]
+        if new_links[i].url in dedup_links_dict.keys():
+            new_links[i] = dedup_links_dict[new_links[i].url]
     log_deduping_finished(len(new_links))
 
-    return all_links, new_links
-
-
-@enforce_types
-def patch_main_index(link: Link, out_dir: str=OUTPUT_DIR) -> None:
-    """hack to in-place update one row's info in the generated index files"""
-
-    # TODO: remove this ASAP, it's ugly, error-prone, and potentially dangerous
-
-    title = link.title or link.latest_outputs(status='succeeded')['title']
-    successful = link.num_outputs
-
-    # Patch JSON main index
-    json_file_links = parse_json_main_index(out_dir)
-    patched_links = []
-    for saved_link in json_file_links:
-        if saved_link.url == link.url:
-            patched_links.append(saved_link.overwrite(
-                title=title,
-                history=link.history,
-                updated=link.updated,
-            ))
-        else:
-            patched_links.append(saved_link)
-    
-    write_json_main_index(patched_links, out_dir=out_dir)
-
-    # Patch HTML main index
-    html_path = os.path.join(out_dir, 'index.html')
-    with open(html_path, 'r') as f:
-        html = f.read().splitlines()
-
-    for idx, line in enumerate(html):
-        if title and ('<span data-title-for="{}"'.format(link.url) in line):
-            html[idx] = '<span>{}</span>'.format(title)
-        elif successful and ('<span data-number-for="{}"'.format(link.url) in line):
-            html[idx] = '<span>{}</span>'.format(successful)
-            break
-
-    atomic_write(html_path, '\n'.join(html))
-
+    return new_links
 
 ### Link Details Index
 
@@ -412,19 +369,19 @@ def load_link_details(link: Link, out_dir: Optional[str]=None) -> Link:
 
 
 LINK_FILTERS = {
-    'exact': lambda link, pattern: (link.url == pattern) or (link.base_url == pattern),
-    'substring': lambda link, pattern: pattern in link.url,
-    'regex': lambda link, pattern: bool(re.match(pattern, link.url)),
-    'domain': lambda link, pattern: link.domain == pattern,
+    'exact': lambda pattern: Q(url=pattern),
+    'substring': lambda pattern: Q(url__icontains=pattern),
+    'regex': lambda pattern: Q(url__iregex=pattern),
+    'domain': lambda pattern: Q(url__istartswith=f"http://{pattern}") | Q(url__istartswith=f"https://{pattern}") | Q(url__istartswith=f"ftp://{pattern}"),
 }
 
 @enforce_types
-def link_matches_filter(link: Link, filter_patterns: List[str], filter_type: str='exact') -> bool:
+def snapshot_filter(snapshots: QuerySet, filter_patterns: List[str], filter_type: str='exact') -> QuerySet:
+    q_filter = Q()
     for pattern in filter_patterns:
         try:
-            if LINK_FILTERS[filter_type](link, pattern):
-                return True
-        except Exception:
+            q_filter = q_filter | LINK_FILTERS[filter_type](pattern)
+        except KeyError:
             stderr()
             stderr(
                 f'[X] Got invalid pattern for --filter-type={filter_type}:',
@@ -432,80 +389,84 @@ def link_matches_filter(link: Link, filter_patterns: List[str], filter_type: str
             )
             stderr(f'    {pattern}')
             raise SystemExit(2)
+    return snapshots.filter(q_filter)
 
-    return False
 
-
-def get_indexed_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_indexed_folders(snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """indexed links without checking archive status or data directory validity"""
+    links = [snapshot.as_link() for snapshot in snapshots.iterator()]
     return {
         link.link_dir: link
         for link in links
     }
 
-def get_archived_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_archived_folders(snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """indexed links that are archived with a valid data directory"""
+    links = [snapshot.as_link() for snapshot in snapshots.iterator()]
     return {
         link.link_dir: link
         for link in filter(is_archived, links)
     }
 
-def get_unarchived_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_unarchived_folders(snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """indexed links that are unarchived with no data directory or an empty data directory"""
+    links = [snapshot.as_link() for snapshot in snapshots.iterator()]
     return {
         link.link_dir: link
         for link in filter(is_unarchived, links)
     }
 
-def get_present_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_present_folders(_snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """dirs that actually exist in the archive/ folder"""
+
     all_folders = {}
 
-    for entry in os.scandir(os.path.join(out_dir, ARCHIVE_DIR_NAME)):
-        if entry.is_dir(follow_symlinks=True):
+    for entry in (Path(out_dir) / ARCHIVE_DIR_NAME).iterdir():
+        if entry.is_dir():
             link = None
             try:
                 link = parse_json_link_details(entry.path)
             except Exception:
                 pass
 
-            all_folders[entry.path] = link
+            all_folders[entry.name] = link
 
     return all_folders
 
-def get_valid_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_valid_folders(snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """dirs with a valid index matched to the main index and archived content"""
+    links = [snapshot.as_link() for snapshot in snapshots.iterator()]
     return {
         link.link_dir: link
         for link in filter(is_valid, links)
     }
 
-def get_invalid_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_invalid_folders(snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """dirs that are invalid for any reason: corrupted/duplicate/orphaned/unrecognized"""
-    duplicate = get_duplicate_folders(links, out_dir=OUTPUT_DIR)
-    orphaned = get_orphaned_folders(links, out_dir=OUTPUT_DIR)
-    corrupted = get_corrupted_folders(links, out_dir=OUTPUT_DIR)
-    unrecognized = get_unrecognized_folders(links, out_dir=OUTPUT_DIR)
+    duplicate = get_duplicate_folders(snapshots, out_dir=OUTPUT_DIR)
+    orphaned = get_orphaned_folders(snapshots, out_dir=OUTPUT_DIR)
+    corrupted = get_corrupted_folders(snapshots, out_dir=OUTPUT_DIR)
+    unrecognized = get_unrecognized_folders(snapshots, out_dir=OUTPUT_DIR)
     return {**duplicate, **orphaned, **corrupted, **unrecognized}
 
 
-def get_duplicate_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_duplicate_folders(snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """dirs that conflict with other directories that have the same link URL or timestamp"""
-    links = list(links)
-    by_url = {link.url: 0 for link in links}
-    by_timestamp = {link.timestamp: 0 for link in links}
-
+    by_url = {}
+    by_timestamp = {}
     duplicate_folders = {}
 
-    indexed_folders = {link.link_dir for link in links}
     data_folders = (
-        entry.path
-        for entry in os.scandir(os.path.join(out_dir, ARCHIVE_DIR_NAME))
-        if entry.is_dir(follow_symlinks=True) and entry.path not in indexed_folders
+        str(entry)
+        for entry in (Path(out_dir) / ARCHIVE_DIR_NAME).iterdir()
+            if entry.is_dir() and not snapshots.filter(timestamp=entry.name).exists()
     )
 
-    for path in chain(sorted(indexed_folders), sorted(data_folders)):
+    for path in chain(snapshots.iterator(), data_folders):
         link = None
+        if type(path) is not str:
+            path = path.as_link().link_dir
+
         try:
             link = parse_json_link_details(path)
         except Exception:
@@ -521,74 +482,72 @@ def get_duplicate_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[
             by_url[link.url] = by_url.get(link.url, 0) + 1
             if by_url[link.url] > 1:
                 duplicate_folders[path] = link
-
     return duplicate_folders
 
-def get_orphaned_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_orphaned_folders(snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """dirs that contain a valid index but aren't listed in the main index"""
-    links = list(links)
-    indexed_folders = {link.link_dir: link for link in links}
     orphaned_folders = {}
 
-    for entry in os.scandir(os.path.join(out_dir, ARCHIVE_DIR_NAME)):
-        if entry.is_dir(follow_symlinks=True):
+    for entry in (Path(out_dir) / ARCHIVE_DIR_NAME).iterdir():
+        if entry.is_dir():
             link = None
             try:
-                link = parse_json_link_details(entry.path)
+                link = parse_json_link_details(str(entry))
             except Exception:
                 pass
 
-            if link and entry.path not in indexed_folders:
+            if link and not snapshots.filter(timestamp=entry.name).exists():
                 # folder is a valid link data dir with index details, but it's not in the main index
-                orphaned_folders[entry.path] = link
+                orphaned_folders[str(entry)] = link
 
     return orphaned_folders
 
-def get_corrupted_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_corrupted_folders(snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """dirs that don't contain a valid index and aren't listed in the main index"""
-    return {
-        link.link_dir: link
-        for link in filter(is_corrupt, links)
-    }
+    corrupted = {}
+    for snapshot in snapshots.iterator():
+        link = snapshot.as_link()
+        if is_corrupt(link):
+            corrupted[link.link_dir] = link
+    return corrupted
 
-def get_unrecognized_folders(links, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
+def get_unrecognized_folders(snapshots, out_dir: str=OUTPUT_DIR) -> Dict[str, Optional[Link]]:
     """dirs that don't contain recognizable archive data and aren't listed in the main index"""
-    by_timestamp = {link.timestamp: 0 for link in links}
     unrecognized_folders: Dict[str, Optional[Link]] = {}
 
-    for entry in os.scandir(os.path.join(out_dir, ARCHIVE_DIR_NAME)):
-        if entry.is_dir(follow_symlinks=True):
-            index_exists = os.path.exists(os.path.join(entry.path, 'index.json'))
+    for entry in (Path(out_dir) / ARCHIVE_DIR_NAME).iterdir():
+        if entry.is_dir():
+            index_exists = (entry / "index.json").exists()
             link = None
             try:
-                link = parse_json_link_details(entry.path)
+                link = parse_json_link_details(str(entry))
             except KeyError:
                 # Try to fix index
                 if index_exists:
                     try:
                         # Last attempt to repair the detail index
-                        link_guessed = parse_json_link_details(entry.path, guess=True)
-                        write_json_link_details(link_guessed, out_dir=entry.path)
-                        link = parse_json_link_details(entry.path)
+                        link_guessed = parse_json_link_details(str(entry), guess=True)
+                        write_json_link_details(link_guessed, out_dir=str(entry))
+                        link = parse_json_link_details(str(entry))
                     except Exception:
                         pass
 
             if index_exists and link is None:
                 # index exists but it's corrupted or unparseable
-                unrecognized_folders[entry.path] = link
+                unrecognized_folders[str(entry)] = link
             
             elif not index_exists:
                 # link details index doesn't exist and the folder isn't in the main index
-                timestamp = entry.path.rsplit('/', 1)[-1]
-                if timestamp not in by_timestamp:
-                    unrecognized_folders[entry.path] = link
+                timestamp = entry.name
+                if not snapshots.filter(timestamp=timestamp).exists():
+                    unrecognized_folders[str(entry)] = link
 
     return unrecognized_folders
 
 
 def is_valid(link: Link) -> bool:
-    dir_exists = os.path.exists(link.link_dir)
-    index_exists = os.path.exists(os.path.join(link.link_dir, 'index.json'))
+    dir_exists = Path(link.link_dir).exists()
+    index_exists = (Path(link.link_dir) / "index.json").exists()
     if not dir_exists:
         # unarchived links are not included in the valid list
         return False
@@ -603,7 +562,7 @@ def is_valid(link: Link) -> bool:
     return False
 
 def is_corrupt(link: Link) -> bool:
-    if not os.path.exists(link.link_dir):
+    if not Path(link.link_dir).exists():
         # unarchived links are not considered corrupt
         return False
 
