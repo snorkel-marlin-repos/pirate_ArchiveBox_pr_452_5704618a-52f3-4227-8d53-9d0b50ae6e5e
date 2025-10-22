@@ -3,9 +3,11 @@ __package__ = 'archivebox'
 import os
 import sys
 import shutil
+from pathlib import Path
 
 from typing import Dict, List, Optional, Iterable, IO, Union
 from crontab import CronTab, CronSlices
+from django.db.models import QuerySet
 
 from .cli import (
     list_subcommands,
@@ -25,10 +27,12 @@ from .util import enforce_types                         # type: ignore
 from .system import get_dir_size, dedupe_cron_jobs, CRON_COMMENT
 from .index import (
     load_main_index,
+    get_empty_snapshot_queryset,
     parse_links_from_source,
     dedupe_links,
     write_main_index,
-    link_matches_filter,
+    write_static_index,
+    snapshot_filter,
     get_indexed_folders,
     get_archived_folders,
     get_unarchived_folders,
@@ -46,12 +50,10 @@ from .index.json import (
     parse_json_links_details,
 )
 from .index.sql import (
-    parse_sql_main_index,
     get_admins,
     apply_migrations,
     remove_from_sql_main_index,
 )
-from .index.html import parse_html_main_index
 from .extractors import archive_links, archive_link, ignore_methods
 from .config import (
     stderr,
@@ -151,7 +153,7 @@ def help(out_dir: str=OUTPUT_DIR) -> None:
     )
 
 
-    if os.path.exists(os.path.join(out_dir, JSON_INDEX_FILENAME)):
+    if os.path.exists(os.path.join(out_dir, SQL_INDEX_FILENAME)):
         print('''{green}ArchiveBox v{}: The self-hosted internet archive.{reset}
 
 {lightred}Active data directory:{reset}
@@ -252,7 +254,12 @@ def init(force: bool=False, out_dir: str=OUTPUT_DIR) -> None:
     """Initialize a new ArchiveBox collection in the current directory"""
     os.makedirs(out_dir, exist_ok=True)
     is_empty = not len(set(os.listdir(out_dir)) - ALLOWED_IN_OUTPUT_DIR)
-    existing_index = os.path.exists(os.path.join(out_dir, JSON_INDEX_FILENAME))
+
+    if (Path(out_dir) / JSON_INDEX_FILENAME).exists():
+        stderr("[!] This folder contains a JSON index. It is deprecated, and will no longer be kept up to date automatically.", color="lightyellow")
+        stderr("    You can run `archivebox list --json --with-headers > index.json` to manually generate it.", color="lightyellow")
+
+    existing_index = (Path(out_dir) / SQL_INDEX_FILENAME).exists()
 
     if is_empty and not existing_index:
         print('{green}[+] Initializing a new ArchiveBox collection in this folder...{reset}'.format(**ANSI))
@@ -264,11 +271,11 @@ def init(force: bool=False, out_dir: str=OUTPUT_DIR) -> None:
         print('{green}------------------------------------------------------------------{reset}'.format(**ANSI))
     else:
         if force:
-            stderr('[!] This folder appears to already have files in it, but no index.json is present.', color='lightyellow')
+            stderr('[!] This folder appears to already have files in it, but no index.sqlite3 is present.', color='lightyellow')
             stderr('    Because --force was passed, ArchiveBox will initialize anyway (which may overwrite existing files).')
         else:
             stderr(
-                ("{red}[X] This folder appears to already have files in it, but no index.json is present.{reset}\n\n"
+                ("{red}[X] This folder appears to already have files in it, but no index.sqlite3 present.{reset}\n\n"
                 "    You must run init in a completely empty directory, or an existing data folder.\n\n"
                 "    {lightred}Hint:{reset} To import an existing data folder make sure to cd into the folder first, \n"
                 "    then run and run 'archivebox init' to pick up where you left off.\n\n"
@@ -317,13 +324,12 @@ def init(force: bool=False, out_dir: str=OUTPUT_DIR) -> None:
     print()
     print('{green}[*] Collecting links from any existing indexes and archive folders...{reset}'.format(**ANSI))
 
-    all_links: Dict[str, Link] = {}
+    all_links = get_empty_snapshot_queryset()
+    pending_links: Dict[str, Link] = {}
+
     if existing_index:
-        all_links = {
-            link.url: link
-            for link in load_main_index(out_dir=out_dir, warn=False)
-        }
-        print('    √ Loaded {} links from existing main index.'.format(len(all_links)))
+        all_links = load_main_index(out_dir=out_dir, warn=False)
+        print('    √ Loaded {} links from existing main index.'.format(all_links.count()))
 
     # Links in data folders that dont match their timestamp
     fixed, cant_fix = fix_invalid_folder_locations(out_dir=out_dir)
@@ -336,36 +342,26 @@ def init(force: bool=False, out_dir: str=OUTPUT_DIR) -> None:
     orphaned_json_links = {
         link.url: link
         for link in parse_json_main_index(out_dir)
-        if link.url not in all_links
+        if not all_links.filter(url=link.url).exists()
     }
     if orphaned_json_links:
-        all_links.update(orphaned_json_links)
+        pending_links.update(orphaned_json_links)
         print('    {lightyellow}√ Added {} orphaned links from existing JSON index...{reset}'.format(len(orphaned_json_links), **ANSI))
-
-    # Links in SQL index but not in main index
-    orphaned_sql_links = {
-        link.url: link
-        for link in parse_sql_main_index(out_dir)
-        if link.url not in all_links
-    }
-    if orphaned_sql_links:
-        all_links.update(orphaned_sql_links)
-        print('    {lightyellow}√ Added {} orphaned links from existing SQL index...{reset}'.format(len(orphaned_sql_links), **ANSI))
 
     # Links in data dir indexes but not in main index
     orphaned_data_dir_links = {
         link.url: link
         for link in parse_json_links_details(out_dir)
-        if link.url not in all_links
+        if not all_links.filter(url=link.url).exists()
     }
     if orphaned_data_dir_links:
-        all_links.update(orphaned_data_dir_links)
+        pending_links.update(orphaned_data_dir_links)
         print('    {lightyellow}√ Added {} orphaned links from existing archive directories.{reset}'.format(len(orphaned_data_dir_links), **ANSI))
 
     # Links in invalid/duplicate data dirs
     invalid_folders = {
         folder: link
-        for folder, link in get_invalid_folders(all_links.values(), out_dir=out_dir).items()
+        for folder, link in get_invalid_folders(all_links, out_dir=out_dir).items()
     }
     if invalid_folders:
         print('    {lightyellow}! Skipped adding {} invalid link data directories.{reset}'.format(len(invalid_folders), **ANSI))
@@ -376,7 +372,7 @@ def init(force: bool=False, out_dir: str=OUTPUT_DIR) -> None:
         print('        archivebox list --status=invalid')
 
 
-    write_main_index(list(all_links.values()), out_dir=out_dir)
+    write_main_index(list(pending_links.values()), out_dir=out_dir, finished=True)
 
     print('\n{green}------------------------------------------------------------------{reset}'.format(**ANSI))
     if existing_index:
@@ -411,21 +407,11 @@ def status(out_dir: str=OUTPUT_DIR) -> None:
     print(f'    Index size: {size} across {num_files} files')
     print()
 
-    links = list(load_main_index(out_dir=out_dir))
-    num_json_links = len(links)
-    num_sql_links = sum(1 for link in parse_sql_main_index(out_dir=out_dir))
-    num_html_links = sum(1 for url in parse_html_main_index(out_dir=out_dir))
+    links = load_main_index(out_dir=out_dir)
+    num_sql_links = links.count()
     num_link_details = sum(1 for link in parse_json_links_details(out_dir=out_dir))
-    print(f'    > JSON Main Index: {num_json_links} links'.ljust(36),  f'(found in {JSON_INDEX_FILENAME})')
     print(f'    > SQL Main Index: {num_sql_links} links'.ljust(36), f'(found in {SQL_INDEX_FILENAME})')
-    print(f'    > HTML Main Index: {num_html_links} links'.ljust(36), f'(found in {HTML_INDEX_FILENAME})')
     print(f'    > JSON Link Details: {num_link_details} links'.ljust(36), f'(found in {ARCHIVE_DIR_NAME}/*/index.json)')
-
-    if num_html_links != len(links) or num_sql_links != len(links):
-        print()
-        print('    {lightred}Hint:{reset} You can fix index count differences automatically by running:'.format(**ANSI))
-        print('        archivebox init')
-    
     print()
     print('{green}[*] Scanning archive data directories...{reset}'.format(**ANSI))
     print(ANSI['lightyellow'], f'   {ARCHIVE_DIR}/*', ANSI['reset'])
@@ -480,7 +466,8 @@ def status(out_dir: str=OUTPUT_DIR) -> None:
     if last_login:
         print(f'    Last UI login: {last_login.username} @ {str(last_login.last_login)[:16]}')
     last_updated = Snapshot.objects.order_by('updated').last()
-    print(f'    Last changes: {str(last_updated.updated)[:16]}')
+    if last_updated:
+        print(f'    Last changes: {str(last_updated.updated)[:16]}')
 
     if not users:
         print()
@@ -488,7 +475,7 @@ def status(out_dir: str=OUTPUT_DIR) -> None:
         print('        archivebox manage createsuperuser')
 
     print()
-    for snapshot in Snapshot.objects.order_by('-updated')[:10]:
+    for snapshot in links.order_by('-updated')[:10]:
         if not snapshot.updated:
             continue
         print(
@@ -538,7 +525,6 @@ def add(urls: Union[str, List[str]],
     # Load list of links from the existing index
     check_data_folder(out_dir=out_dir)
     check_dependencies()
-    all_links: List[Link] = []
     new_links: List[Link] = []
     all_links = load_main_index(out_dir=out_dir)
 
@@ -561,8 +547,10 @@ def add(urls: Union[str, List[str]],
             new_links_depth += parse_links_from_source(downloaded_file, root_url=new_link.url)
 
     imported_links = list({link.url: link for link in (new_links + new_links_depth)}.values())
-    all_links, new_links = dedupe_links(all_links, imported_links)
-    write_main_index(links=all_links, out_dir=out_dir, finished=not new_links)
+    new_links = dedupe_links(all_links, imported_links)
+
+    write_main_index(links=new_links, out_dir=out_dir, finished=not new_links)
+    all_links = load_main_index(out_dir=out_dir)
 
     if index_only:
         return all_links
@@ -575,19 +563,16 @@ def add(urls: Union[str, List[str]],
     elif new_links:
         archive_links(new_links, overwrite=False, out_dir=out_dir)
     else:
-        # nothing was updated, don't bother re-saving the index
         return all_links
-
-    # Step 4: Re-write links index with updated titles, icons, and resources
-    all_links = load_main_index(out_dir=out_dir)
-    write_main_index(links=list(all_links), out_dir=out_dir, finished=True)
+    
+    write_static_index([link.as_link_with_details() for link in all_links], out_dir=out_dir)
     return all_links
 
 @enforce_types
 def remove(filter_str: Optional[str]=None,
            filter_patterns: Optional[List[str]]=None,
            filter_type: str='exact',
-           links: Optional[List[Link]]=None,
+           snapshots: Optional[QuerySet]=None,
            after: Optional[float]=None,
            before: Optional[float]=None,
            yes: bool=False,
@@ -597,7 +582,7 @@ def remove(filter_str: Optional[str]=None,
     
     check_data_folder(out_dir=out_dir)
 
-    if links is None:
+    if snapshots is None:
         if filter_str and filter_patterns:
             stderr(
                 '[X] You should pass either a pattern as an argument, '
@@ -613,60 +598,54 @@ def remove(filter_str: Optional[str]=None,
             )
             stderr()
             hint(('To remove all urls you can run:',
-                  'archivebox remove --filter-type=regex ".*"'))
+                'archivebox remove --filter-type=regex ".*"'))
             stderr()
             raise SystemExit(2)
         elif filter_str:
             filter_patterns = [ptn.strip() for ptn in filter_str.split('\n')]
 
-        log_list_started(filter_patterns, filter_type)
-        timer = TimedProgress(360, prefix='      ')
-        try:
-            links = list(list_links(
-                filter_patterns=filter_patterns,
-                filter_type=filter_type,
-                after=after,
-                before=before,
-            ))
-        finally:
-            timer.end()
+    list_kwargs = {
+        "filter_patterns": filter_patterns,
+        "filter_type": filter_type,
+        "after": after,
+        "before": before,
+    }
+    if snapshots:
+        list_kwargs["snapshots"] = snapshots
+
+    log_list_started(filter_patterns, filter_type)
+    timer = TimedProgress(360, prefix='      ')
+    try:
+        snapshots = list_links(**list_kwargs)
+    finally:
+        timer.end()
 
 
-    if not len(links):
+    if not snapshots.exists():
         log_removal_finished(0, 0)
         raise SystemExit(1)
 
 
-    log_list_finished(links)
-    log_removal_started(links, yes=yes, delete=delete)
+    log_links = [link.as_link() for link in snapshots]
+    log_list_finished(log_links)
+    log_removal_started(log_links, yes=yes, delete=delete)
 
     timer = TimedProgress(360, prefix='      ')
     try:
-        to_keep = []
-        to_delete = []
-        all_links = load_main_index(out_dir=out_dir)
-        for link in all_links:
-            should_remove = (
-                (after is not None and float(link.timestamp) < after)
-                or (before is not None and float(link.timestamp) > before)
-                or link_matches_filter(link, filter_patterns or [], filter_type)
-                or link in links
-            )
-            if should_remove:
-                to_delete.append(link)
-
-                if delete:
-                    shutil.rmtree(link.link_dir, ignore_errors=True)
-            else:
-                to_keep.append(link)
+        for snapshot in snapshots:
+            if delete:
+                shutil.rmtree(snapshot.as_link().link_dir, ignore_errors=True)
     finally:
         timer.end()
 
-    remove_from_sql_main_index(links=to_delete, out_dir=out_dir)
-    write_main_index(links=to_keep, out_dir=out_dir, finished=True)
-    log_removal_finished(len(all_links), len(to_keep))
+    to_remove = snapshots.count()
+
+    remove_from_sql_main_index(snapshots=snapshots, out_dir=out_dir)
+    all_snapshots = load_main_index(out_dir=out_dir)
+    write_static_index([link.as_link_with_details() for link in all_snapshots], out_dir=out_dir)
+    log_removal_finished(all_snapshots.count(), to_remove)
     
-    return to_keep
+    return all_snapshots
 
 @enforce_types
 def update(resume: Optional[float]=None,
@@ -684,25 +663,18 @@ def update(resume: Optional[float]=None,
 
     check_data_folder(out_dir=out_dir)
     check_dependencies()
+    new_links: List[Link] = [] # TODO: Remove input argument: only_new
 
-    # Step 1: Load list of links from the existing index
-    #         merge in and dedupe new links from import_path
-    all_links: List[Link] = []
-    new_links: List[Link] = []
-    all_links = load_main_index(out_dir=out_dir)
-
-    # Step 2: Write updated index with deduped old and new links back to disk
-    write_main_index(links=list(all_links), out_dir=out_dir)
-
-    # Step 3: Filter for selected_links
-    matching_links = list_links(
+    # Step 1: Filter for selected_links
+    matching_snapshots = list_links(
         filter_patterns=filter_patterns,
         filter_type=filter_type,
         before=before,
         after=after,
     )
+
     matching_folders = list_folders(
-        links=list(matching_links),
+        links=matching_snapshots,
         status=status,
         out_dir=out_dir,
     )
@@ -711,7 +683,7 @@ def update(resume: Optional[float]=None,
     if index_only:
         return all_links
         
-    # Step 3: Run the archive methods for each link
+    # Step 2: Run the archive methods for each link
     to_archive = new_links if only_new else all_links
     if resume:
         to_archive = [
@@ -727,7 +699,7 @@ def update(resume: Optional[float]=None,
 
     # Step 4: Re-write links index with updated titles, icons, and resources
     all_links = load_main_index(out_dir=out_dir)
-    write_main_index(links=list(all_links), out_dir=out_dir, finished=True)
+    write_static_index([link.as_link_with_details() for link in all_links], out_dir=out_dir)
     return all_links
 
 @enforce_types
@@ -740,6 +712,8 @@ def list_all(filter_patterns_str: Optional[str]=None,
              sort: Optional[str]=None,
              csv: Optional[str]=None,
              json: bool=False,
+             html: bool=False,
+             with_headers: bool=False,
              out_dir: str=OUTPUT_DIR) -> Iterable[Link]:
     """List, filter, and export information about archive entries"""
     
@@ -756,7 +730,7 @@ def list_all(filter_patterns_str: Optional[str]=None,
         filter_patterns = filter_patterns_str.split('\n')
 
 
-    links = list_links(
+    snapshots = list_links(
         filter_patterns=filter_patterns,
         filter_type=filter_type,
         before=before,
@@ -764,20 +738,21 @@ def list_all(filter_patterns_str: Optional[str]=None,
     )
 
     if sort:
-        links = sorted(links, key=lambda link: getattr(link, sort))
+        snapshots = snapshots.order_by(sort)
 
     folders = list_folders(
-        links=list(links),
+        links=snapshots,
         status=status,
         out_dir=out_dir,
     )
     
-    print(printable_folders(folders, json=json, csv=csv))
+    print(printable_folders(folders, json=json, csv=csv, html=html, with_headers=with_headers))
     return folders
 
 
 @enforce_types
-def list_links(filter_patterns: Optional[List[str]]=None,
+def list_links(snapshots: Optional[QuerySet]=None,
+               filter_patterns: Optional[List[str]]=None,
                filter_type: str='exact',
                after: Optional[float]=None,
                before: Optional[float]=None,
@@ -785,19 +760,18 @@ def list_links(filter_patterns: Optional[List[str]]=None,
     
     check_data_folder(out_dir=out_dir)
 
-    all_links = load_main_index(out_dir=out_dir)
+    if snapshots:
+        all_snapshots = snapshots
+    else:
+        all_snapshots = load_main_index(out_dir=out_dir)
 
-    for link in all_links:
-        if after is not None and float(link.timestamp) < after:
-            continue
-        if before is not None and float(link.timestamp) > before:
-            continue
-        
-        if filter_patterns:
-            if link_matches_filter(link, filter_patterns, filter_type):
-                yield link
-        else:
-            yield link
+    if after is not None:
+        all_snapshots = all_snapshots.filter(timestamp__lt=after)
+    if before is not None:
+        all_snapshots = all_snapshots.filter(timestamp__gt=before)
+    if filter_patterns:
+        all_snapshots = snapshot_filter(all_snapshots, filter_patterns, filter_type)
+    return all_snapshots
 
 @enforce_types
 def list_folders(links: List[Link],
@@ -806,30 +780,23 @@ def list_folders(links: List[Link],
     
     check_data_folder(out_dir=out_dir)
 
-    if status == 'indexed':
-        return get_indexed_folders(links, out_dir=out_dir)
-    elif status == 'archived':
-        return get_archived_folders(links, out_dir=out_dir)
-    elif status == 'unarchived':
-        return get_unarchived_folders(links, out_dir=out_dir)
+    STATUS_FUNCTIONS = {
+        "indexed": get_indexed_folders,
+        "archived": get_archived_folders,
+        "unarchived": get_unarchived_folders,
+        "present": get_present_folders,
+        "valid": get_valid_folders,
+        "invalid": get_invalid_folders,
+        "duplicate": get_duplicate_folders,
+        "orphaned": get_orphaned_folders,
+        "corrupted": get_corrupted_folders,
+        "unrecognized": get_unrecognized_folders,
+    }
 
-    elif status == 'present':
-        return get_present_folders(links, out_dir=out_dir)
-    elif status == 'valid':
-        return get_valid_folders(links, out_dir=out_dir)
-    elif status == 'invalid':
-        return get_invalid_folders(links, out_dir=out_dir)
-
-    elif status == 'duplicate':
-        return get_duplicate_folders(links, out_dir=out_dir)
-    elif status == 'orphaned':
-        return get_orphaned_folders(links, out_dir=out_dir)
-    elif status == 'corrupted':
-        return get_corrupted_folders(links, out_dir=out_dir)
-    elif status == 'unrecognized':
-        return get_unrecognized_folders(links, out_dir=out_dir)
-
-    raise ValueError('Status not recognized.')
+    try:
+        return STATUS_FUNCTIONS[status](links, out_dir=out_dir)
+    except KeyError:
+        raise ValueError('Status not recognized.')
 
 
 @enforce_types

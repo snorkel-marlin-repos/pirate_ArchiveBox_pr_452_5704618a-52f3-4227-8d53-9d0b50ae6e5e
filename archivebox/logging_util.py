@@ -14,6 +14,8 @@ from typing import Optional, List, Dict, Union, IO, TYPE_CHECKING
 if TYPE_CHECKING:
     from .index.schema import Link, ArchiveResult
 
+from .index.json import MAIN_INDEX_HEADER
+
 from .util import enforce_types
 from .config import (
     ConfigDict,
@@ -406,19 +408,18 @@ def log_removal_started(links: List["Link"], yes: bool, delete: bool):
         except (KeyboardInterrupt, EOFError, AssertionError):
             raise SystemExit(0)
 
-def log_removal_finished(all_links: int, to_keep: int):
+def log_removal_finished(all_links: int, to_remove: int):
     if all_links == 0:
         print()
         print('{red}[X] No matching links found.{reset}'.format(**ANSI))
     else:
-        num_removed = all_links - to_keep
         print()
         print('{red}[√] Removed {} out of {} links from the archive index.{reset}'.format(
-            num_removed,
+            to_remove,
             all_links,
             **ANSI,
         ))
-        print('    Index now contains {} links.'.format(to_keep))
+        print('    Index now contains {} links.'.format(all_links - to_remove))
 
 
 def log_shell_welcome_msg():
@@ -460,14 +461,34 @@ def printable_filesize(num_bytes: Union[int, float]) -> str:
 @enforce_types
 def printable_folders(folders: Dict[str, Optional["Link"]],
                       json: bool=False,
-                      csv: Optional[str]=None) -> str:
+                      html: bool=False,
+                      csv: Optional[str]=None,
+                      with_headers: bool=False) -> str:
+    links = folders.values()
     if json: 
         from .index.json import to_json
-        return to_json(folders.values(), indent=4, sort_keys=True)
-
+        if with_headers:
+            output = {
+                **MAIN_INDEX_HEADER,
+                'num_links': len(links),
+                'updated': datetime.now(),
+                'last_run_cmd': sys.argv,
+                'links': links,
+            }
+        else:
+            output = links
+        return to_json(output, indent=4, sort_keys=True)
+    elif html:
+        from .index.html import main_index_template
+        if with_headers:
+            output = main_index_template(links, True)
+        else:
+            from .index.html import MINIMAL_INDEX_TEMPLATE
+            output = main_index_template(links, True, MINIMAL_INDEX_TEMPLATE)
+        return output
     elif csv:
         from .index.csv import links_to_csv
-        return links_to_csv(folders.values(), cols=csv.split(','), header=True)
+        return links_to_csv(folders.values(), cols=csv.split(','), header=with_headers)
     
     return '\n'.join(
         f'{folder} {link and link.url} "{link and link.title}"'
